@@ -1,362 +1,361 @@
-# JD-Resume-Matcher Streamlit app (final)
-# Save this file as `app.py`
-# Requirements (pip install): streamlit pandas openpyxl python-docx pdfminer.six rapidfuzz
-# This version normalizes extracted skill labels and ties years-extraction to skill presence.
+# Enhanced JD-Resume Matcher (UI improvements)
+# Save as app.py and run: streamlit run app.py
+# Requirements: streamlit pandas openpyxl python-docx pdfminer.six rapidfuzz openpyxl
 
 import streamlit as st
 import pandas as pd
-import io
-import re
+import io, re, json, os
+from collections import OrderedDict
 from docx import Document
 from pdfminer.high_level import extract_text as pdf_extract_text
 from rapidfuzz import fuzz
 
-st.set_page_config(page_title="JD ↔ Resume Matcher", layout="wide")
+st.set_page_config(page_title="JD ↔ Resume Matcher (Enhanced UI)", layout="wide")
 
-st.title("JD ↔ Resume Matcher (final)")
-st.markdown(
-    "Upload a Job Description (PDF / DOCX / TXT) and multiple resumes. "
-    "This app normalizes skill names, extracts required years from the JD, "
-    "parses years from resumes only when the skill is mentioned, and computes a weighted match score."
-)
-
-# ----------------- helpers -----------------
-
+# ------------------ Helpers ------------------
 def read_text_file(uploaded):
     data = uploaded.read()
     try:
-        return data.decode("utf-8")
+        return data.decode("utf-8", errors="ignore")
     except Exception:
-        return data.decode("latin-1", errors="ignore")
+        try:
+            return data.decode("latin-1", errors="ignore")
+        except:
+            return ""
 
-def read_pdf(uploaded):
+def read_pdf_from_path(path_or_file):
     try:
-        uploaded.seek(0)
-        return pdf_extract_text(uploaded)
+        if isinstance(path_or_file, str):
+            return pdf_extract_text(path_or_file)
+        else:
+            path_or_file.seek(0)
+            return pdf_extract_text(path_or_file)
     except Exception as e:
-        st.warning(f"PDF parsing warning: {e}")
+        st.warning(f"PDF parse warning: {e}")
         return ""
 
-def read_docx(uploaded):
+def read_docx_from_path(path_or_file):
     try:
-        uploaded.seek(0)
-        doc = Document(uploaded)
-        parts = [p.text for p in doc.paragraphs]
-        return "\n".join(parts)
+        if isinstance(path_or_file, str):
+            doc = Document(path_or_file)
+        else:
+            path_or_file.seek(0)
+            doc = Document(path_or_file)
+        return "\n".join(p.text for p in doc.paragraphs)
     except Exception as e:
-        st.warning(f"DOCX parsing warning: {e}")
+        st.warning(f"DOCX parse warning: {e}")
         return ""
 
-def normalize_text(text):
-    return re.sub(r"\s+", " ", (text or "")).strip()
+def extract_text_any(uploaded, filename=None):
+    if filename and filename.lower().endswith(".pdf"):
+        return read_pdf_from_path(uploaded)
+    if filename and filename.lower().endswith(".docx"):
+        return read_docx_from_path(uploaded)
+    # fallback: try to read bytes as text
+    try:
+        return read_text_file(uploaded)
+    except:
+        return ""
 
-# ---------- skill normalization ----------
+# normalization and cleaning
+NOISE_RE = re.compile(r'\b(exp|exp\.|experience|expertise|minimum|should|years|yrs)\b', re.I)
+PUNCT_RE = re.compile(r'[\(\)\[\]\-_:,\/]+')
+
 def normalize_skill_label(s):
-    """
-    Normalize raw extracted skill labels.
-    Removes noise words like 'exp', 'expertise', 'experience', 'minimum', 'should', and punctuation.
-    Collapses spaces and returns uppercase-trimmed token preserving useful words.
-    """
     if not s:
         return ""
-    s = s.strip()
-    # remove common noise tokens (word boundaries)
-    s = re.sub(r'\b(exp|exp\.|expertise|experience|expert|minimum|should|years|yrs|skills?)\b', ' ', s, flags=re.I)
-    # remove parentheses and punctuation commonly attached to skills
-    s = re.sub(r'[\(\)\[\]\-_:,\/]+', ' ', s)
-    # collapse multiple spaces and trim
-    s = re.sub(r'\s+', ' ', s).strip()
-    return s
+    x = s.strip()
+    x = NOISE_RE.sub(" ", x)
+    x = PUNCT_RE.sub(" ", x)
+    x = re.sub(r'\s+', ' ', x).strip()
+    return x
 
-# ---------- year parsing utilities ----------
 def parse_years_from_text(s):
     if not s:
         return None
-    s = s.strip()
-    # range like 3-5 -> take upper bound, also accept 3 – 5 with Unicode dash
+    m = re.search(r'(\d+)\s*\+?\s*(?:years|yrs|y)', s)
+    if m:
+        try:
+            return int(m.group(1))
+        except:
+            return None
     m = re.search(r'(\d+)\s*[-–]\s*(\d+)', s)
     if m:
         try:
             return int(m.group(2))
-        except Exception:
-            pass
-    m = re.search(r'(\d+)\+?', s)
-    if m:
+        except:
+            return None
+    return None
+
+# presence detection improved
+def has_skill(text, skill, synonyms=None, strict=False):
+    if not text or not skill:
+        return False
+    t = text.lower()
+    s = skill.lower().strip()
+    candidates = [s]
+    if synonyms:
+        candidates += [v.lower() for v in synonyms]
+    # exact or substring
+    for c in candidates:
+        if c and c in t:
+            return True
+    # whole-token check
+    tokens = [w for w in re.split(r'\W+', s) if w]
+    if tokens and all(re.search(rf'\b{re.escape(tok)}\b', t) for tok in tokens):
+        return True
+    # fuzzy only when not strict and skill length reasonable
+    if not strict and len(s) > 3:
         try:
-            return int(m.group(1))
-        except Exception:
-            pass
-    return None
+            score = fuzz.partial_ratio(s, t)
+            return score >= 85
+        except:
+            return False
+    return False
 
-# ---------- extract required years from JD ----------
-def extract_required_experience_for_skill(jd_text, skill):
-    """
-    Attempts to find explicit required years for a given skill in the JD text.
-    Returns integer years or None.
-    """
-    if not jd_text or not skill:
-        return None
-    low = jd_text.lower()
-    skill_low = re.escape(skill.lower())
-    # pattern 1: "minimum 5 years ... in TOSCA" or "at least 5 years of experience in TOSCA"
-    m = re.search(rf'(?:minimum|at least|required|needs?|must have|experience of)\s+(\d+)\s*(?:\+)?\s*(?:years|yrs|y)\b.*?(?:in|with)?\s*(?:{skill_low})', low)
-    if m:
-        return int(m.group(1))
-    # pattern 2: "TOSCA (5+ years)" or "TOSCA - 5 years"
-    m = re.search(rf'(?:{skill_low}).{{0,60}}?(\d+\+?\s*(?:years|yrs|y))', low)
-    if m:
-        return parse_years_from_text(m.group(1))
-    # pattern 3: "5 years of experience in TOSCA"
-    m = re.search(rf'(\d+\+?\s*(?:years|yrs|y)).{{0,60}}?(?:in|with)\s+{skill_low}', low)
-    if m:
-        return parse_years_from_text(m.group(1))
-    return None
-
-# ---------- extract years from resume only if skill present nearby ----------
-def extract_years_for_skill_from_resume(res_text, skill):
-    """
-    Search for the skill in short windows and extract explicit numeric "years" mentions in those windows.
-    Only fallback to a global years if the skill appears somewhere (to avoid assigning years when the skill isn't present).
-    """
-    if not res_text or not skill:
-        return None
-    low = res_text.lower()
-    skill_low = re.escape(skill.lower())
+def extract_years_near_skill(text, skill_syns, window=120):
+    t = text.lower()
     years_found = []
-    skill_seen = False
-
-    # search small windows around all occurrences of the skill
-    for m in re.finditer(rf'(.{{0,60}}{skill_low}.{{0,60}})', low):
-        skill_seen = True
-        window = m.group(0)
-        # first try patterns like "5 years", "4+ yrs", "3-5 years" inside the window
-        m2 = re.search(r'(\d+\s*[-–]\s*\d+|\d+\+?)(?=\s*(?:years|yrs|y))', window)
-        if m2:
-            y = parse_years_from_text(m2.group(1))
-            if y is not None:
-                years_found.append(y)
-                continue
-        m3 = re.search(r'(\d+\s*[-–]\s*\d+|\d+\+?)\s*(?:years|yrs|y)\s*(?:of\s+experience)?', window)
-        if m3:
-            y = parse_years_from_text(m3.group(1))
-            if y is not None:
-                years_found.append(y)
-                continue
-
-    # Only fallback to a loose global search if the skill was seen somewhere (conservative)
-    if not years_found and skill_seen:
-        m4 = re.search(r'(\d+\s*[-–]\s*\d+|\d+\+?)\s*(?:years|yrs|y)\s*(?:of\s+experience)?', low)
-        if m4:
-            y = parse_years_from_text(m4.group(1))
-            if y is not None:
-                years_found.append(y)
-
+    for syn in skill_syns:
+        for m in re.finditer(re.escape(syn.lower()), t):
+            start = max(0, m.start() - window)
+            end = min(len(t), m.end() + window)
+            win = t[start:end]
+            m2 = re.findall(r'(\d+\s*[-–]\s*\d+|\d+\+?)\s*(?:years|yrs|y)', win)
+            for g in m2:
+                if "-" in g:
+                    nums = re.findall(r'(\d+)', g)
+                    if nums:
+                        years_found.append(int(nums[-1]))
+                else:
+                    n = re.search(r'(\d+)', g)
+                    if n:
+                        years_found.append(int(n.group(1)))
     if years_found:
         return max(years_found)
-    return None
+    # fallback: global years
+    m3 = re.findall(r'(\d+\s*[-–]\s*\d+|\d+\+?)\s*(?:years|yrs|y)', t)
+    for g in m3:
+        if "-" in g:
+            nums = re.findall(r'(\d+)', g)
+            if nums:
+                years_found.append(int(nums[-1]))
+        else:
+            n = re.search(r'(\d+)', g)
+            if n:
+                years_found.append(int(n.group(1)))
+    return max(years_found) if years_found else None
 
-# ---------- presence check (improved fuzzy) ----------
-def has_skill(text, skill, threshold=80):
-    if not skill:
-        return False
-    text_low = (text or "").lower()
-    skill_low = skill.lower()
-    # exact substring match first
-    if skill_low in text_low:
-        return True
-    # match individual tokens (all tokens of skill must appear)
-    words = [w for w in re.split(r'\W+', skill_low) if w]
-    if words and all(w in text_low for w in words if len(w) >= 2):
-        return True
-    # fallback fuzzy partial ratio
-    try:
-        score = fuzz.partial_ratio(skill_low, text_low)
-        return score >= threshold
-    except Exception:
-        return False
+# default synonym map (copyable/editable)
+DEFAULT_SYNONYMS = {
+    "ci/cd": ["ci/cd","ci cd","continuous integration","continuous delivery","jenkins","pipeline","devops"],
+    "tosca": ["tosca","tricentis tosca","tricentis"],
+    "web application automation": ["web application","web app","ui automation","selenium","frontend","web testing","browser testing"],
+    "mainframe automation testing": ["mainframe","3270","green screen","mainframe testing","jcl","cobol"]
+}
 
-# ----------------- UI -----------------
-with st.sidebar:
-    st.header("Options")
-    jd_file = st.file_uploader("Upload JD (PDF / DOCX / TXT)", type=["pdf", "docx", "txt"], key="jd")
-    resume_files = st.file_uploader("Upload Resumes (PDF / DOCX / TXT) - select multiple", type=["pdf", "docx", "txt"], accept_multiple_files=True, key="resumes")
-    min_match = st.slider("Minimum Match % to show", 0, 100, 50)
-    use_master = st.checkbox("Use built-in master skills list", value=True)
+# ------------------ UI Layout ------------------
+st.title("JD ↔ Resume Matcher — Enhanced UI")
+st.markdown("Upload a Job Description and resumes. Clean the extracted skills, add synonyms, tune weights, and run matching.")
+
+# left column: JD deconstruction + upload
+left, mid, right = st.columns([1,2,1])
+
+with left:
+    st.header("1) Upload JD & Controls")
+    jd_file = st.file_uploader("Upload JD (PDF/DOCX/TXT)", type=["pdf","docx","txt"], key="jd_upload")
+    auto_normalize_btn = st.button("Auto-normalize extracted skills")
+    accept_all_btn = st.button("Accept all skills (move to skill list)")
+    st.markdown("**Presence weight** (default = 60%)")
+    presence_weight = st.slider("Presence weight (%)", 40, 90, 60)
+    enforce_years = st.checkbox("Enforce JD years strictly", value=True)
     st.markdown("---")
-    st.markdown("Matching: presence = 60% and experience fulfillment = 40% when JD specifies years. Skill labels are normalized automatically.")
+    st.markdown("Upload resumes (multiple)")
+    resumes = st.file_uploader("Upload Resumes (PDF/DOCX/TXT) - select multiple", type=["pdf","docx","txt"], accept_multiple_files=True, key="resumes")
+    st.info("Recommended: DOCX or text-based PDF. For scanned PDFs use OCR externally.")
 
-if not jd_file:
-    st.info("Please upload a JD to start.")
-    st.stop()
+# mid: skill list visual
+with mid:
+    st.header("2) Deconstructed Skills")
+    jd_text_area = st.empty()
+    if jd_file:
+        extracted = ""
+        if jd_file.name.lower().endswith(".pdf"):
+            extracted = read_pdf_from_path(jd_file)
+        elif jd_file.name.lower().endswith(".docx"):
+            extracted = read_docx_from_path(jd_file)
+        else:
+            extracted = read_text_file(jd_file)
+        extracted = extracted or ""
+        jd_text_area = st.text_area("JD preview (editable)", value=extracted, height=220, key="jd_preview")
+        # simple extraction heuristics: find capitalized phrases and master list hits
+        master_skills = ["TOSCA","CI/CD","Web Application Automation","Mainframe Automation Testing","LoadRunner","Dynatrace","Splunk","VUGen"]
+        candidates = []
+        # master hits
+        for ms in master_skills:
+            if ms.lower() in jd_text_area.lower() and ms not in candidates:
+                candidates.append(ms)
+        # capitalized phrases heuristics
+        caps = re.findall(r'\b([A-Z][A-Za-z0-9+\-#.]{1,}(?:\s+[A-Z][A-Za-z0-9+\-#.]{1,}){0,2})\b', jd_text_area)
+        for c in caps:
+            if len(c.split())<=4 and c not in candidates:
+                candidates.append(c)
+        # show candidates with detected years
+        st.write("Auto-extracted candidates (edit before accepting):")
+        cand_df = []
+        for c in candidates:
+            norm = normalize_skill_label(c)
+            # find years if any near mention
+            req = None
+            m = re.search(rf'(?:minimum|at least|>=|\b{re.escape(c)}\b).{{0,80}}?(\d+)\s*(?:\+)?\s*(?:years|yrs|y)', jd_text_area, re.I)
+            if m:
+                try:
+                    req = int(m.group(1))
+                except:
+                    req = None
+            cand_df.append({"raw":c,"normalized":norm,"req":req})
+        if cand_df:
+            df_cand = pd.DataFrame(cand_df)
+            st.dataframe(df_cand)
+    else:
+        st.info("Upload a JD to extract skills.")
 
-# read JD
-jd_file.seek(0)
-if jd_file.name.lower().endswith(".pdf"):
-    jd_text = read_pdf(jd_file)
-elif jd_file.name.lower().endswith(".docx"):
-    jd_text = read_docx(jd_file)
-else:
-    jd_text = read_text_file(jd_file)
+    st.markdown("**Skill list (editable)**")
+    skill_list_area = st.text_area("One skill per line. Prefix with M: for Mandatory, D: for Desired (optional).", value="", height=200, key="skill_list")
+    # parse skills area into structured list
+    def parse_skill_list(text):
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        skills_struct = []
+        for line in lines:
+            tag = "desired"
+            content = line
+            if line.lower().startswith("m:") or line.lower().startswith("mandatory:"):
+                tag = "mandatory"
+                content = line.split(":",1)[1].strip()
+            elif line.lower().startswith("d:") or line.lower().startswith("desired:"):
+                tag = "desired"
+                content = line.split(":",1)[1].strip()
+            norm = normalize_skill_label(content)
+            skills_struct.append({"skill":norm,"group":tag,"req":None})
+        return skills_struct
 
-jd_text = normalize_text(jd_text)
-if not jd_text:
-    st.error("Could not extract text from the JD file.")
-    st.stop()
+    user_skills = parse_skill_list(skill_list_area) if skill_list_area.strip() else []
+    # populate default if empty and JD exists
+    if not user_skills and jd_file:
+        # use candidates as base
+        user_skills = []
+        for c in candidates:
+            norm = normalize_skill_label(c)
+            user_skills.append({"skill":norm,"group":"mandatory" if "minimum" in c.lower() or "min" in c.lower() else "desired","req":None})
+    # show editable table-like interface
+    if user_skills:
+        st.write("Final skills (you can edit the textarea above and re-parse):")
+        sk_rows = []
+        for s in user_skills:
+            sk_rows.append(f"{ 'M:' if s['group']=='mandatory' else 'D:' } {s['skill']}{' | req:'+str(s['req']) if s['req'] else ''}")
+        st.text_area("Parsed skills (read-only preview)", value="\n".join(sk_rows), height=160)
 
-st.subheader("Job Description (extracted text)")
-st.text_area("JD preview (editable)", value=jd_text, height=200, key="jd_preview")
-jd_text = st.session_state["jd_preview"]
-
-# initial skill extraction heuristics + master list
-MASTER_SKILLS = [
-    "Java","Spring Boot","Spring","Hibernate","SQL","MySQL","PostgreSQL","Oracle","NoSQL",
-    "MongoDB","Docker","Kubernetes","AWS","Azure","GCP","CI/CD","Jenkins","Git","SVN","Bitbucket",
-    "Microservices","REST","SOAP","Agile","Scrum","Linux","Python","Node.js","React","Angular",
-    "CSS","HTML","TypeScript","Redis","Kafka","RabbitMQ","Elasticsearch","Spark","Hadoop","TOSCA"
-]
-
-def extract_skill_candidates(jd_text):
-    found = []
-    low = (jd_text or "").lower()
-    for s in MASTER_SKILLS:
-        if s.lower() in low and s not in found:
-            found.append(s)
-    # heuristics: Capitalized phrases
-    caps = re.findall(r'\b([A-Z][A-Za-z0-9+\-#.]{1,}(?:\s+[A-Z][A-Za-z0-9+\-#.]{1,}){0,2})\b', jd_text)
-    for c in caps:
-        if len(c.split()) <= 4 and c.lower() not in [x.lower() for x in found]:
-            found.append(c)
-    # preserve order unique
-    seen = set()
-    res = []
-    for x in found:
-        key = x.lower()
-        if key not in seen:
-            seen.add(key)
-            res.append(x)
-    return res
-
-candidates = extract_skill_candidates(jd_text)
-# optionally add master skills explicitly present
-if use_master:
-    for s in MASTER_SKILLS:
-        if s.lower() in jd_text.lower() and s not in candidates:
-            candidates.append(s)
-
-# normalize candidate labels to stable tokens
-normalized_candidates = []
-for c in candidates:
-    norm = normalize_skill_label(c)
-    if norm and norm.lower() not in [x.lower() for x in normalized_candidates]:
-        normalized_candidates.append(norm)
-skills = normalized_candidates.copy()
-
-st.subheader("Deconstructed Skills / Keywords")
-skills_input = st.text_area("Edit skill list (one per line). Normalized automatically.", value="\n".join(skills), height=200)
-# final skills from editable box (normalize again to avoid user typing noise)
-skills = [normalize_skill_label(s.strip()) for s in skills_input.splitlines() if s.strip()]
-# remove duplicates preserving order
-seen = set()
-final_skills = []
-for s in skills:
-    key = s.lower()
-    if key not in seen:
-        seen.add(key)
-        final_skills.append(s)
-skills = final_skills
-
-# extract required years per skill from JD
-skill_requirements = {}
-for skl in skills:
-    req = extract_required_experience_for_skill(jd_text, skl)
-    skill_requirements[skl] = req  # possibly None
-
-if not resume_files:
-    st.warning("Upload resumes in the sidebar to run matching.")
-    st.stop()
-
-rows = []
-for uploaded in resume_files:
+# right: synonyms and matching controls
+with right:
+    st.header("3) Synonyms & Matching")
+    st.write("Default synonyms (editable):")
+    synonyms_state = st.text_area("Edit synonyms as JSON (skill: [variants])", value=json.dumps(DEFAULT_SYNONYMS, indent=2), height=220, key="synonyms_json")
     try:
-        uploaded.seek(0)
-        if uploaded.name.lower().endswith(".pdf"):
-            res_text = read_pdf(uploaded)
-        elif uploaded.name.lower().endswith(".docx"):
-            res_text = read_docx(uploaded)
-        else:
-            res_text = read_text_file(uploaded)
-        res_text = normalize_text(res_text)
-    except Exception as e:
-        st.warning(f"Error parsing {uploaded.name}: {e}")
-        res_text = ""
+        synonyms_map = json.loads(synonyms_state)
+    except:
+        st.error("Invalid JSON for synonyms; revert to default.")
+        synonyms_map = DEFAULT_SYNONYMS.copy()
+    st.markdown("---")
+    strict_matching = st.checkbox("Strict matching (avoid fuzzy for short tokens)", value=True)
+    st.markdown("Show / Hide columns in results:")
+    show_presence = st.checkbox("Show presence columns", value=True)
+    show_years = st.checkbox("Show years columns", value=True)
+    st.markdown("---")
+    run_button = st.button("Run Matching", key="run_match")
 
-    matched_info = {}
-    skill_scores = []
-    for skl in skills:
-        present = has_skill(res_text, skl)
-        years = extract_years_for_skill_from_resume(res_text, skl) if present else None
-        req = skill_requirements.get(skl)
-        req_satisfied = ""
-        score = 0.0
-        # scoring logic: presence weighted 60%, experience (if required) 40%
-        if req is not None:
-            if years is not None:
-                req_satisfied = "Yes" if years >= req else "No"
-                exp_ratio = min(years / req, 1.0)
-            else:
-                req_satisfied = "No"
-                exp_ratio = 0.0
-            presence_val = 1.0 if present else 0.0
-            score = 0.6 * presence_val + 0.4 * exp_ratio
-        else:
-            presence_val = 1.0 if present else 0.0
-            score = presence_val  # 1 or 0
+# ------------------ Matching ------------------
+def build_skills_from_user(user_skills, synonyms_map):
+    skills = []
+    for s in user_skills:
+        name = s['skill']
+        grp = s.get('group','desired')
+        req = s.get('req')
+        syns = synonyms_map.get(name.lower(), [])
+        skills.append({"name":name, "group":grp, "req":req, "synonyms":syns})
+    return skills
 
-        skill_scores.append(score)
-        matched_info[f"{skl}_presence"] = "Yes" if present else "No"
-        matched_info[f"{skl}_years"] = f"{years}y" if years is not None else ""
-        matched_info[f"{skl}_req"] = f"{req}y" if req is not None else ""
-        matched_info[f"{skl}_req_satisfied"] = req_satisfied
-        matched_info[f"{skl}_score_%"] = round(score * 100, 2)
+if run_button:
+    if not jd_file:
+        st.error("Please upload JD before running.")
+    elif not resumes:
+        st.error("Please upload resumes before running.")
+    else:
+        with st.spinner("Parsing resumes and running matcher..."):
+            # finalize skills from textarea
+            final_skills = build_skills_from_user(user_skills, synonyms_map)
+            # compute weights: default presence/experience split from presence_weight slider
+            presence_w = presence_weight/100.0
+            exp_w = 1.0 - presence_w
 
-    overall_pct = round((sum(skill_scores) / len(skill_scores)) * 100, 2) if skills else 0.0
-    row = {"Resume": uploaded.name, "Match %": overall_pct}
-    row.update(matched_info)
-    rows.append(row)
+            results = []
+            for up in resumes:
+                fname = up.name
+                txt = extract_text_any(up, fname)
+                txt_norm = txt or ""
+                row = {"Resume":fname}
 
-# Build dataframe with stable columns order
-cols = ["Resume", "Match %"]
-for skl in skills:
-    cols += [f"{skl}_presence", f"{skl}_years", f"{skl}_req", f"{skl}_req_satisfied", f"{skl}_score_%"]
+                # per-skill checks
+                mandatory_scores = []
+                desired_scores = []
+                for sk in final_skills:
+                    name = sk['name']
+                    syns = sk.get('synonyms',[])
+                    group = sk.get('group','desired')
+                    req = sk.get('req')
+                    present = has_skill(txt_norm, name, synonyms=syns, strict=strict_matching)
+                    years = extract_years_near_skill(txt_norm, [name]+syns) if present else None
+                    # compute skill score
+                    if req:
+                        # requirement exists -> presence + years enforcement
+                        if present and years is not None:
+                            exp_ratio = min(years / req, 1.0)
+                            score = presence_w * 1.0 + exp_w * exp_ratio
+                        elif present and years is None:
+                            score = presence_w * 1.0 + exp_w * 0.0
+                        else:
+                            score = 0.0
+                    else:
+                        score = 1.0 if present else 0.0
 
-df = pd.DataFrame(rows)
-for c in cols:
-    if c not in df.columns:
-        df[c] = ""
-df = df[cols]
+                    # store columns
+                    row[f"{name}_presence"] = "Yes" if present else "No"
+                    row[f"{name}_years"] = f"{years}y" if years else ""
+                    row[f"{name}_req"] = f"{req}y" if req else ""
+                    row[f"{name}_score_%"] = round(score*100,2)
+                    if group=='mandatory':
+                        mandatory_scores.append(score)
+                    else:
+                        desired_scores.append(score)
 
-st.subheader("Match Results")
-st.dataframe(df)
+                # aggregate weighted scores: default weights (mandatory 80% desired 20%) but user can adjust in advanced UI later
+                mand_weight = 0.8
+                des_weight = 0.2
+                mand_avg = sum(mandatory_scores)/len(mandatory_scores) if mandatory_scores else 0.0
+                des_avg = sum(desired_scores)/len(desired_scores) if desired_scores else 0.0
+                overall = round((mand_avg*mand_weight + des_avg*des_weight)*100,2)
+                row['Match %'] = overall
+                results.append(row)
 
-filtered = df[df["Match %"] >= min_match]
-st.markdown(f"**{len(filtered)}** resumes meet the minimum match of {min_match}%")
-st.dataframe(filtered)
+            df = pd.DataFrame(results)
+            st.success("Matching complete. Preview results below:")
+            # allow column visibility customization
+            st.dataframe(df)
+            # export excel
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                df.to_excel(writer, index=False, sheet_name='JD Match Analysis')
+            output.seek(0)
+            st.download_button('Download Excel', data=output, file_name='jd_match_results.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
-# Export to Excel
-output = io.BytesIO()
-with pd.ExcelWriter(output, engine="openpyxl") as writer:
-    df.to_excel(writer, index=False, sheet_name="JD Match Analysis")
-output.seek(0)
-
-st.download_button(
-    "Download results as Excel",
-    data=output,
-    file_name="jd_resume_match_results.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-)
-
-st.markdown("---")
-st.markdown("Notes:")
-st.markdown("- Skill labels are normalized automatically to remove noise words like 'Exp','Expertise','Minimum'.")
-st.markdown("- Presence = 60% weight; Experience fulfillment (when JD specifies) = 40%.")
-st.markdown("- Years are only assigned to a skill if that skill is detected in the resume text near a numeric mention.")
+st.markdown('---')
+st.markdown('Need a feature? Tell me which UI improvement to add next.')
