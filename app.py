@@ -212,8 +212,7 @@ st.dataframe(filtered)
 output = io.BytesIO()
 with pd.ExcelWriter(output, engine='openpyxl') as writer:
     df.to_excel(writer, index=False, sheet_name='JD Match Analysis')
-    writer.save()
-output.seek(0)
+   output.seek(0)
 
 st.download_button('Download results as Excel', data=output, file_name='jd_resume_match_results.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
